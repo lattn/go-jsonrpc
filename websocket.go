@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"reflect"
 	"sync"
@@ -17,7 +18,9 @@ import (
 )
 
 const wsCancel = "xrpc.cancel"
+
 const chValue = "xrpc.ch.val"
+
 const chClose = "xrpc.ch.close"
 
 var debugTrace = os.Getenv("JSONRPC_ENABLE_DEBUG_TRACE") == "1"
@@ -143,7 +146,7 @@ func (c *wsConn) nextWriter(cb func(io.Writer)) {
 
 	wcl, err := c.conn.NextWriter(websocket.TextMessage)
 	if err != nil {
-		log.Errorw("websocket NextWriter failed", "error", err)
+		slog.Error("websocket NextWriter failed", "error", err)
 		cb(io.Discard)
 		return
 	}
@@ -151,7 +154,8 @@ func (c *wsConn) nextWriter(cb func(io.Writer)) {
 	cb(wcl)
 
 	if err := wcl.Close(); err != nil {
-		log.Errorw("websocket writer close failed", "error", err)
+		slog.Error("websocket writer close failed", "error", err)
+		return
 	}
 }
 
@@ -160,7 +164,7 @@ func (c *wsConn) sendRequest(req request) error {
 	defer c.writeLk.Unlock()
 
 	if debugTrace {
-		log.Debugw("sendRequest", "req", req.Method, "id", req.ID)
+		slog.Debug("sendRequest", "req", req.Method, "id", req.ID)
 	}
 
 	if err := c.conn.WriteJSON(req); err != nil {
@@ -200,7 +204,7 @@ func (c *wsConn) handleOutChans() {
 			if !ok {
 				// control channel closed - signals closed connection
 				// This shouldn't happen, instead the exiting channel should get closed
-				log.Warn("control channel closed")
+				slog.Warn("control channel closed")
 				return
 			}
 
@@ -220,7 +224,7 @@ func (c *wsConn) handleOutChans() {
 				}
 
 				if err := json.NewEncoder(w).Encode(resp); err != nil {
-					log.Error(err)
+					slog.Error("nextWriter", "error", err)
 					return
 				}
 			})
@@ -235,7 +239,7 @@ func (c *wsConn) handleOutChans() {
 				// requests
 				return
 			}
-			log.Warn("exiting channel received a message")
+			slog.Warn("exiting channel received a message")
 			continue
 		}
 
@@ -255,7 +259,7 @@ func (c *wsConn) handleOutChans() {
 
 			rp, err := json.Marshal([]param{{v: reflect.ValueOf(id)}})
 			if err != nil {
-				log.Error(err)
+				slog.Error("Marshal", "error", err)
 				continue
 			}
 
@@ -265,7 +269,7 @@ func (c *wsConn) handleOutChans() {
 				Method:  chClose,
 				Params:  rp,
 			}); err != nil {
-				log.Warnf("closed out channel sendRequest failed: %s", err)
+				slog.Warn("closed out channel sendRequest failed", "error", err)
 			}
 			continue
 		}
@@ -273,7 +277,7 @@ func (c *wsConn) handleOutChans() {
 		// forward message
 		rp, err := json.Marshal([]param{{v: reflect.ValueOf(caseToID[chosen-internal])}, {v: val}})
 		if err != nil {
-			log.Errorw("marshaling params for sendRequest failed", "err", err)
+			slog.Error("marshaling params for sendRequest failed", "error", err)
 			continue
 		}
 
@@ -283,7 +287,7 @@ func (c *wsConn) handleOutChans() {
 			Method:  chValue,
 			Params:  rp,
 		}); err != nil {
-			log.Warnf("sendRequest failed: %s", err)
+			slog.Warn("sendRequest failed", "error", err)
 			return
 		}
 	}
@@ -325,7 +329,7 @@ func (c *wsConn) handleCtxAsync(actx context.Context, id interface{}) {
 
 	rp, err := json.Marshal([]param{{v: reflect.ValueOf(id)}})
 	if err != nil {
-		log.Errorw("marshaling params for sendRequest failed", "err", err)
+		slog.Error("marshaling params for sendRequest failed", "error", err)
 		return
 	}
 
@@ -334,25 +338,25 @@ func (c *wsConn) handleCtxAsync(actx context.Context, id interface{}) {
 		Method:  wsCancel,
 		Params:  rp,
 	}); err != nil {
-		log.Warnw("failed to send request", "method", wsCancel, "id", id, "error", err.Error())
+		slog.Warn("failed to send request", "method", wsCancel, "id", id, "error", err.Error())
 	}
 }
 
 // cancelCtx is a built-in rpc which handles context cancellation over rpc
 func (c *wsConn) cancelCtx(req frame) {
 	if req.ID != nil {
-		log.Warnf("%s call with ID set, won't respond", wsCancel)
+		slog.Warn("call with ID set, won't respond", "id", wsCancel)
 	}
 
 	var params []param
 	if err := json.Unmarshal(req.Params, &params); err != nil {
-		log.Error("failed to unmarshal channel id in xrpc.ch.val: %s", err)
+		slog.Error("failed to unmarshal channel id in xrpc.ch.val", "error", err)
 		return
 	}
 
 	var id interface{}
 	if err := json.Unmarshal(params[0].data, &id); err != nil {
-		log.Errorw("failed to unmarshal cancel ID", "error", err)
+		slog.Error("failed to unmarshal cancel ID", "error", err)
 		return
 	}
 
@@ -372,13 +376,13 @@ func (c *wsConn) cancelCtx(req frame) {
 func (c *wsConn) handleChanMessage(frame frame) {
 	var params []param
 	if err := json.Unmarshal(frame.Params, &params); err != nil {
-		log.Error("failed to unmarshal channel id in xrpc.ch.val: %s", err)
+		slog.Error("failed to unmarshal channel id in xrpc.ch.val", "error", err)
 		return
 	}
 
 	var chid uint64
 	if err := json.Unmarshal(params[0].data, &chid); err != nil {
-		log.Error("failed to unmarshal channel id in xrpc.ch.val: %s", err)
+		slog.Error("failed to unmarshal channel id in xrpc.ch.val", "error", err)
 		return
 	}
 
@@ -386,7 +390,7 @@ func (c *wsConn) handleChanMessage(frame frame) {
 	hnd, ok := c.chanHandlers[chid]
 	if !ok {
 		c.chanHandlersLk.Unlock()
-		log.Errorf("xrpc.ch.val: handler %d not found", chid)
+		slog.Error("xrpc.ch.val: handler not found", "handler", chid)
 		return
 	}
 
@@ -401,13 +405,13 @@ func (c *wsConn) handleChanMessage(frame frame) {
 func (c *wsConn) handleChanClose(frame frame) {
 	var params []param
 	if err := json.Unmarshal(frame.Params, &params); err != nil {
-		log.Error("failed to unmarshal channel id in xrpc.ch.val: %s", err)
+		slog.Error("failed to unmarshal channel id in xrpc.ch.val", "error", err)
 		return
 	}
 
 	var chid uint64
 	if err := json.Unmarshal(params[0].data, &chid); err != nil {
-		log.Error("failed to unmarshal channel id in xrpc.ch.val: %s", err)
+		slog.Error("failed to unmarshal channel id in xrpc.ch.val", "error", err)
 		return
 	}
 
@@ -415,7 +419,7 @@ func (c *wsConn) handleChanClose(frame frame) {
 	hnd, ok := c.chanHandlers[chid]
 	if !ok {
 		c.chanHandlersLk.Unlock()
-		log.Errorf("xrpc.ch.val: handler %d not found", chid)
+		slog.Error("xrpc.ch.val: handler not found", "handler", chid)
 		return
 	}
 
@@ -434,7 +438,7 @@ func (c *wsConn) handleResponse(frame frame) {
 	req, ok := c.inflight[frame.ID]
 	c.inflightLk.Unlock()
 	if !ok {
-		log.Error("client got unknown ID in response")
+		slog.Error("client got unknown ID in response")
 		return
 	}
 
@@ -442,7 +446,7 @@ func (c *wsConn) handleResponse(frame frame) {
 		// output is channel
 		var chid uint64
 		if err := json.Unmarshal(frame.Result, &chid); err != nil {
-			log.Errorf("failed to unmarshal channel id response: %s, data '%s'", err, string(frame.Result))
+			slog.Error("failed to unmarshal channel id response", "error", err, "response", string(frame.Result))
 			return
 		}
 
@@ -468,7 +472,7 @@ func (c *wsConn) handleResponse(frame frame) {
 
 func (c *wsConn) handleCall(ctx context.Context, frame frame) {
 	if c.handler == nil {
-		log.Error("handleCall on client with no reverse handler")
+		slog.Error("handleCall on client with no reverse handler")
 		return
 	}
 
@@ -552,7 +556,6 @@ func (c *wsConn) closeInFlight() {
 	}
 	c.handling = map[interface{}]context.CancelFunc{}
 	c.handlingLk.Unlock()
-
 }
 
 func (c *wsConn) closeChans() {
@@ -604,7 +607,7 @@ func (c *wsConn) setupPings() func() {
 			case <-time.After(c.pingInterval):
 				c.writeLk.Lock()
 				if err := c.conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
-					log.Errorf("sending ping message: %+v", err)
+					slog.Error("sending ping message", "error", err)
 				}
 				c.writeLk.Unlock()
 			case <-stop:
@@ -643,7 +646,7 @@ func (c *wsConn) tryReconnect(ctx context.Context) bool {
 			}
 			var err error
 			if conn, err = c.connFactory(); err != nil {
-				log.Debugw("websocket connection retry failed", "error", err)
+				slog.Debug("websocket connection retry failed", "error", err)
 			}
 			select {
 			case <-ctx.Done():
@@ -684,7 +687,7 @@ func (c *wsConn) readFrame(ctx context.Context, r io.Reader) {
 
 	c.frameExecQueue <- buf
 	if len(c.frameExecQueue) > 2*cap(c.frameExecQueue)/3 { // warn at 2/3 capacity
-		log.Warnw("frame executor queue is backlogged", "queued", len(c.frameExecQueue), "cap", cap(c.frameExecQueue))
+		slog.Warn("frame executor queue is backlogged", "queued", len(c.frameExecQueue), "cap", cap(c.frameExecQueue))
 	}
 
 	// got the whole frame, can start reading the next one in background
@@ -699,7 +702,7 @@ func (c *wsConn) frameExecutor(ctx context.Context) {
 		case buf := <-c.frameExecQueue:
 			var frame frame
 			if err := json.Unmarshal(buf, &frame); err != nil {
-				log.Warnw("failed to unmarshal frame", "error", err)
+				slog.Warn("failed to unmarshal frame", "error", err)
 				// todo send invalid request response
 				continue
 			}
@@ -707,7 +710,7 @@ func (c *wsConn) frameExecutor(ctx context.Context) {
 			var err error
 			frame.ID, err = normalizeID(frame.ID)
 			if err != nil {
-				log.Warnw("failed to normalize frame id", "error", err)
+				slog.Warn("failed to normalize frame id", "error", err)
 				// todo send invalid request response
 				continue
 			}
@@ -790,7 +793,7 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 				return // remote closed
 			}
 
-			log.Debugw("websocket error", "error", err, "lastAction", action, "time", time.Since(start))
+			slog.Debug("websocket error", "error", err, "lastAction", action, "time", time.Since(start))
 			// only client needs to reconnect
 			if !c.tryReconnect(ctx) {
 				return // failed to reconnect
@@ -798,12 +801,12 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 		case rerr := <-c.readError:
 			action = "read-error"
 
-			log.Debugw("websocket error", "error", rerr, "lastAction", action, "time", time.Since(start))
+			slog.Debug("websocket error", "error", rerr, "lastAction", action, "time", time.Since(start))
 			if !c.tryReconnect(ctx) {
 				return // failed to reconnect
 			}
 		case <-ctx.Done():
-			log.Debugw("context cancelled", "error", ctx.Err(), "lastAction", action, "time", time.Since(start))
+			slog.Debug("context cancelled", "error", ctx.Err(), "lastAction", action, "time", time.Since(start))
 			return
 		case req := <-c.requests:
 			action = fmt.Sprintf("send-request(%s,%v)", req.req.Method, req.req.ID)
@@ -832,7 +835,7 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 			c.writeLk.Unlock()
 			serr := c.sendRequest(req.req)
 			if serr != nil {
-				log.Errorw("sendRequest failed", "method", req.req.Method, "id", req.req.ID, "error", serr)
+				slog.Error("sendRequest failed", "method", req.req.Method, "id", req.req.ID, "error", serr)
 
 				if req.req.ID != nil {
 					c.inflightLk.Lock()
@@ -868,10 +871,10 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 
 			c.writeLk.Lock()
 			if err := c.conn.Close(); err != nil {
-				log.Warnw("timed-out websocket close error", "error", err)
+				slog.Warn("timed-out websocket close error", "error", err)
 			}
 			c.writeLk.Unlock()
-			log.Errorw("Connection timeout", "remote", c.conn.RemoteAddr(), "lastAction", action)
+			slog.Error("Connection timeout", "remote", c.conn.RemoteAddr(), "lastAction", action)
 			// The server side does not perform the reconnect operation, so need to exit
 			if c.connFactory == nil {
 				return
@@ -882,20 +885,20 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 			c.writeLk.Lock()
 			cmsg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
 			if err := c.conn.WriteMessage(websocket.CloseMessage, cmsg); err != nil {
-				log.Warn("failed to write close message: ", err)
+				slog.Warn("failed to write close message", "error", err)
 			}
 			if err := c.conn.Close(); err != nil {
-				log.Warnw("websocket close error", "error", err)
+				slog.Warn("websocket close error", "error", err)
 			}
 			c.writeLk.Unlock()
 			return
 		}
 
 		if c.pingInterval > 0 && time.Since(start) > c.pingInterval*2 {
-			log.Warnw("websocket long time no response", "lastAction", action, "time", time.Since(start))
+			slog.Warn("websocket long time no response", "lastAction", action, "time", time.Since(start))
 		}
 		if debugTrace {
-			log.Debugw("websocket action", "lastAction", action, "time", time.Since(start))
+			slog.Warn("websocket action", "lastAction", action, "time", time.Since(start))
 		}
 	}
 }
@@ -922,7 +925,7 @@ type deadlineResetReader struct {
 func (r *deadlineResetReader) Read(p []byte) (n int, err error) {
 	n, err = r.r.Read(p)
 	if time.Since(r.lastReset) > onReadDeadlineResetInterval {
-		log.Warnw("slow/large read, resetting deadline while reading the frame", "since", time.Since(r.lastReset), "n", n, "err", err, "p", len(p))
+		slog.Warn("slow/large read, resetting deadline while reading the frame", "since", time.Since(r.lastReset), "n", n, "error", err, "p", len(p))
 
 		r.reset()
 		r.lastReset = time.Now()
@@ -933,7 +936,7 @@ func (r *deadlineResetReader) Read(p []byte) (n int, err error) {
 func (c *wsConn) resetReadDeadline() {
 	if c.timeout > 0 {
 		if err := c.conn.SetReadDeadline(time.Now().Add(c.timeout)); err != nil {
-			log.Error("setting read deadline", err)
+			slog.Error("setting read deadline", "error", err)
 		}
 	}
 }
