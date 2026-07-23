@@ -576,10 +576,6 @@ func (c *wsConn) closeChans() {
 }
 
 func (c *wsConn) setupPings() func() {
-	if c.pingInterval == 0 {
-		return func() {}
-	}
-
 	c.conn.SetPongHandler(func(appData string) error {
 		select {
 		case c.pongs <- struct{}{}:
@@ -587,14 +583,22 @@ func (c *wsConn) setupPings() func() {
 		}
 		return nil
 	})
+	pingHandler := c.conn.PingHandler()
 	c.conn.SetPingHandler(func(appData string) error {
-		// treat pings as pongs - this lets us register server activity even if it's too busy to respond to our pings
+		// Record activity before delegating to the websocket ping handler. This
+		// preserves the historical "treat pings as pongs" behavior while still
+		// replying with a protocol-level pong.
 		select {
 		case c.pongs <- struct{}{}:
 		default:
 		}
-		return nil
+
+		return pingHandler(appData)
 	})
+
+	if c.pingInterval == 0 {
+		return func() {}
+	}
 
 	stop := make(chan struct{})
 
