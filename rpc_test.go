@@ -88,7 +88,7 @@ func TestRawRequests(t *testing.T) {
 	defer testServ.Close()
 
 	removeSpaces := func(jsonStr string) (string, error) {
-		var jsonObj interface{}
+		var jsonObj any
 		err := json.Unmarshal([]byte(jsonStr), &jsonObj)
 		if err != nil {
 			return "", err
@@ -159,7 +159,7 @@ func TestReconnection(t *testing.T) {
 	// record the number of connection attempts during this test
 	connectionAttempts := int64(1)
 
-	closer, err := NewMergeClient(context.Background(), "ws://"+testServ.Listener.Addr().String(), "SimpleServerHandler", []interface{}{&rpcClient}, nil, func(c *Config) {
+	closer, err := NewMergeClient(context.Background(), "ws://"+testServ.Listener.Addr().String(), "SimpleServerHandler", []any{&rpcClient}, nil, func(c *Config) {
 		c.proxyConnFactory = func(f func() (*websocket.Conn, error)) func() (*websocket.Conn, error) {
 			return func() (*websocket.Conn, error) {
 				defer func() {
@@ -192,6 +192,96 @@ func TestReconnection(t *testing.T) {
 	attemptsPerSecond := atomic.LoadInt64(&connectionAttempts) / int64(captureDuration/time.Second)
 
 	assert.Less(t, attemptsPerSecond, int64(50))
+}
+
+func TestWebsocketPingHandlerSendsPongAndRecordsActivity(t *testing.T) {
+	pingData := "geth-ping"
+
+	activity := make(chan struct{}, 1)
+	serverReady := make(chan struct{})
+	serverDone := make(chan error, 1)
+
+	testServ := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer func() {
+			_ = conn.Close()
+		}()
+
+		ws := &wsConn{
+			conn:  conn,
+			pongs: activity,
+		}
+		stopPings := ws.setupPings()
+		defer stopPings()
+
+		close(serverReady)
+
+		_, _, err = conn.NextReader()
+		serverDone <- err
+	}))
+	defer testServ.Close()
+
+	client, _, err := websocket.DefaultDialer.Dial("ws://"+testServ.Listener.Addr().String(), nil)
+	require.NoError(t, err)
+	defer func() {
+		_ = client.Close()
+	}()
+
+	select {
+	case <-serverReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not finish websocket ping setup")
+	}
+
+	receivedPong := make(chan string, 1)
+	client.SetPongHandler(func(appData string) error {
+		receivedPong <- appData
+		return nil
+	})
+
+	clientReadDone := make(chan error, 1)
+	go func() {
+		for {
+			if _, _, err := client.NextReader(); err != nil {
+				clientReadDone <- err
+				return
+			}
+		}
+	}()
+
+	err = client.WriteControl(websocket.PingMessage, []byte(pingData), time.Now().Add(time.Second))
+	require.NoError(t, err)
+
+	select {
+	case <-activity:
+	case <-time.After(2 * time.Second):
+		t.Fatal("inbound websocket ping was not recorded as activity")
+	}
+
+	select {
+	case appData := <-receivedPong:
+		require.Equal(t, pingData, appData)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for websocket pong")
+	}
+
+	require.NoError(t, client.Close())
+
+	select {
+	case <-clientReadDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("client read loop did not exit after close")
+	}
+
+	select {
+	case <-serverDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server read loop did not exit after client close")
+	}
 }
 
 func (h *SimpleServerHandler) ErrChanSub(ctx context.Context) (<-chan int, error) {
@@ -970,7 +1060,7 @@ func TestServerChanLockClose(t *testing.T) {
 
 	_, err := NewMergeClient(context.Background(), "ws://"+testServ.Listener.Addr().String(),
 		"ChanHandler",
-		[]interface{}{&client}, nil,
+		[]any{&client}, nil,
 		func(c *Config) {
 			c.proxyConnFactory = func(f func() (*websocket.Conn, error)) func() (*websocket.Conn, error) {
 				return func() (*websocket.Conn, error) {
@@ -1159,7 +1249,7 @@ func TestInterfaceHandler(t *testing.T) {
 	testServ := httptest.NewServer(rpcServer)
 	defer testServ.Close()
 
-	closer, err := NewMergeClient(context.Background(), "ws://"+testServ.Listener.Addr().String(), "InterfaceHandler", []interface{}{&client}, nil, WithParamEncoder(new(io.Reader), readerEnc))
+	closer, err := NewMergeClient(context.Background(), "ws://"+testServ.Listener.Addr().String(), "InterfaceHandler", []any{&client}, nil, WithParamEncoder(new(io.Reader), readerEnc))
 	require.NoError(t, err)
 
 	defer closer()
@@ -1268,7 +1358,7 @@ func TestUserError(t *testing.T) {
 		TestP  func() error
 		TestMy func(s string) error
 	}
-	closer, err := NewMergeClient(context.Background(), "ws://"+testServ.Listener.Addr().String(), "ErrHandler", []interface{}{
+	closer, err := NewMergeClient(context.Background(), "ws://"+testServ.Listener.Addr().String(), "ErrHandler", []any{
 		&client,
 	}, nil, WithErrors(errs))
 	require.NoError(t, err)
@@ -1293,7 +1383,7 @@ func TestIDHandling(t *testing.T) {
 
 	cases := []struct {
 		str       string
-		expect    interface{}
+		expect    any
 		expectErr bool
 	}{
 		{
@@ -1323,6 +1413,89 @@ func TestIDHandling(t *testing.T) {
 	}
 }
 
+func TestWebsocketControlFrames(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload string
+	}{
+		{
+			name:    "cancel/missing params",
+			payload: `{"jsonrpc":"2.0","method":"xrpc.cancel"}`,
+		},
+		{
+			name:    "cancel/missing ID",
+			payload: `{"jsonrpc":"2.0","method":"xrpc.cancel","params":[]}`,
+		},
+		{
+			name:    "cancel/array ID",
+			payload: `{"jsonrpc":"2.0","method":"xrpc.cancel","params":[[]]}`,
+		},
+		{
+			name:    "cancel/object ID",
+			payload: `{"jsonrpc":"2.0","method":"xrpc.cancel","params":[{}]}`,
+		},
+		{
+			name:    "channel value/missing params",
+			payload: `{"jsonrpc":"2.0","method":"xrpc.ch.val"}`,
+		},
+		{
+			name:    "channel value/missing channel ID",
+			payload: `{"jsonrpc":"2.0","method":"xrpc.ch.val","params":[]}`,
+		},
+		{
+			name:    "channel value/missing value",
+			payload: `{"jsonrpc":"2.0","method":"xrpc.ch.val","params":[1]}`,
+		},
+		{
+			name:    "channel value/invalid channel ID",
+			payload: `{"jsonrpc":"2.0","method":"xrpc.ch.val","params":["invalid",0]}`,
+		},
+		{
+			name:    "channel close/missing params",
+			payload: `{"jsonrpc":"2.0","method":"xrpc.ch.close"}`,
+		},
+		{
+			name:    "channel close/missing channel ID",
+			payload: `{"jsonrpc":"2.0","method":"xrpc.ch.close","params":[]}`,
+		},
+		{
+			name:    "channel close/invalid channel ID",
+			payload: `{"jsonrpc":"2.0","method":"xrpc.ch.close","params":["invalid"]}`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rpcServer := NewServer()
+			rpcServer.Register("SimpleServerHandler", &SimpleServerHandler{})
+
+			testServ := httptest.NewServer(rpcServer)
+			defer testServ.Close()
+
+			conn, _, err := websocket.DefaultDialer.Dial("ws://"+testServ.Listener.Addr().String(), nil)
+			require.NoError(t, err)
+			defer conn.Close()
+
+			require.NoError(t, conn.WriteMessage(websocket.TextMessage, []byte(test.payload)))
+			require.NoError(t, conn.WriteMessage(websocket.TextMessage, []byte(
+				`{"jsonrpc":"2.0","method":"SimpleServerHandler.AddGet","params":[41],"id":1}`,
+			)))
+
+			require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+			_, msg, err := conn.ReadMessage()
+			require.NoError(t, err)
+
+			var resp struct {
+				Result int           `json:"result"`
+				Error  *JSONRPCError `json:"error,omitempty"`
+			}
+			require.NoError(t, json.Unmarshal(msg, &resp))
+			require.Nil(t, resp.Error)
+			require.Equal(t, 41, resp.Result)
+		})
+	}
+}
+
 func TestAliasedCall(t *testing.T) {
 	// setup server
 
@@ -1337,7 +1510,7 @@ func TestAliasedCall(t *testing.T) {
 	var client struct {
 		WhateverMethodName func(int) (int, error) `rpc_method:"ServName.AddGet"`
 	}
-	closer, err := NewMergeClient(context.Background(), "ws://"+testServ.Listener.Addr().String(), "Server", []interface{}{
+	closer, err := NewMergeClient(context.Background(), "ws://"+testServ.Listener.Addr().String(), "Server", []any{
 		&client,
 	}, nil)
 	require.NoError(t, err)
@@ -1380,7 +1553,7 @@ func TestNotif(t *testing.T) {
 			var client struct {
 				Notif func() error `notify:"true"`
 			}
-			closer, err := NewMergeClient(context.Background(), proto+"://"+testServ.Listener.Addr().String(), "Notif", []interface{}{
+			closer, err := NewMergeClient(context.Background(), proto+"://"+testServ.Listener.Addr().String(), "Notif", []any{
 				&client,
 			}, nil)
 			require.NoError(t, err)
@@ -1429,7 +1602,7 @@ func TestCallWithRawParams(t *testing.T) {
 	var client struct {
 		Call func(ctx context.Context, ps RawParams) (int, error)
 	}
-	closer, err := NewMergeClient(context.Background(), "ws://"+testServ.Listener.Addr().String(), "Raw", []interface{}{
+	closer, err := NewMergeClient(context.Background(), "ws://"+testServ.Listener.Addr().String(), "Raw", []any{
 		&client,
 	}, nil)
 	require.NoError(t, err)
@@ -1489,7 +1662,7 @@ func TestReverseCall(t *testing.T) {
 	var client struct {
 		Call func() error
 	}
-	closer, err := NewMergeClient(context.Background(), "ws://"+testServ.Listener.Addr().String(), "Server", []interface{}{
+	closer, err := NewMergeClient(context.Background(), "ws://"+testServ.Listener.Addr().String(), "Server", []any{
 		&client,
 	}, nil, WithClientHandler("Client", &RevCallTestClientHandler{}))
 	require.NoError(t, err)
@@ -1541,7 +1714,7 @@ func TestReverseCallAliased(t *testing.T) {
 	var client struct {
 		Call func() error
 	}
-	closer, err := NewMergeClient(context.Background(), "ws://"+testServ.Listener.Addr().String(), "Server", []interface{}{
+	closer, err := NewMergeClient(context.Background(), "ws://"+testServ.Listener.Addr().String(), "Server", []any{
 		&client,
 	}, nil, WithClientHandler("Client", &RevCallTestClientHandler{}), WithClientHandlerAlias("rpc_thing", "Client.CallOnClient"))
 	require.NoError(t, err)
@@ -1594,7 +1767,7 @@ func TestReverseCallDroppedConn(t *testing.T) {
 	var client struct {
 		Call func() error
 	}
-	closer, err := NewMergeClient(context.Background(), "ws://"+testServ.Listener.Addr().String(), "Server", []interface{}{
+	closer, err := NewMergeClient(context.Background(), "ws://"+testServ.Listener.Addr().String(), "Server", []any{
 		&client,
 	}, nil, WithClientHandler("Client", &RevCallTestClientHandler{}))
 	require.NoError(t, err)
@@ -1742,7 +1915,7 @@ func TestNewCustomClient(t *testing.T) {
 	}
 
 	// Create custom client
-	closer, err := NewCustomClient("SimpleServerHandler", []interface{}{&client}, doRequest)
+	closer, err := NewCustomClient("SimpleServerHandler", []any{&client}, doRequest)
 	require.NoError(t, err)
 	defer closer()
 
@@ -1774,7 +1947,7 @@ func TestReverseCallWithCustomMethodName(t *testing.T) {
 	var client struct {
 		Call func(ctx context.Context, ps RawParams) error `rpc_method:"Server_Call"`
 	}
-	closer, err := NewMergeClient(context.Background(), "ws://"+testServ.Listener.Addr().String(), "Server", []interface{}{
+	closer, err := NewMergeClient(context.Background(), "ws://"+testServ.Listener.Addr().String(), "Server", []any{
 		&client,
 	}, nil)
 	require.NoError(t, err)
@@ -1816,4 +1989,145 @@ func TestContentTypeHeader(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "2.0", jsonResp.Jsonrpc)
 	assert.Equal(t, float64(1), jsonResp.ID) // JSON numbers are unmarshaled as float64
+}
+
+type panicJSONResult struct{}
+
+func (panicJSONResult) MarshalJSON() ([]byte, error) {
+	panic("marshal boom")
+}
+
+type panicJSONHandler struct{}
+
+func (panicJSONHandler) PanicResult() (panicJSONResult, error) {
+	return panicJSONResult{}, nil
+}
+
+func (panicJSONHandler) PanicStream() (<-chan panicJSONResult, error) {
+	out := make(chan panicJSONResult, 1)
+	out <- panicJSONResult{}
+	close(out)
+	return out, nil
+}
+
+func (panicJSONHandler) AddGet(in int) (int, error) {
+	return in + 1, nil
+}
+
+func quietRPCLogsForTest(t *testing.T) {
+	t.Helper()
+	slog.SetLogLoggerLevel(slog.LevelError)
+	t.Cleanup(func() {
+		slog.SetLogLoggerLevel(slog.LevelDebug)
+	})
+}
+
+func TestEncodeWebsocketResponseFallback(t *testing.T) {
+	quietRPCLogsForTest(t)
+
+	var buf bytes.Buffer
+	encodeWebsocketResponse(&buf, &response{
+		Jsonrpc: "2.0",
+		ID:      float64(1),
+		Result:  panicJSONResult{},
+	})
+
+	var resp response
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &resp))
+	require.Equal(t, float64(1), resp.ID)
+	require.NotNil(t, resp.Error)
+	require.Equal(t, ErrorCode(0), resp.Error.Code)
+	require.Contains(t, resp.Error.Message, "panic encoding websocket response")
+}
+
+func TestResponseMarshalPanicReturnsErrorAndConnectionSurvives(t *testing.T) {
+	quietRPCLogsForTest(t)
+
+	rpcServer := NewServer()
+	rpcServer.Register("Panic", panicJSONHandler{})
+
+	testServ := httptest.NewServer(rpcServer)
+	defer testServ.Close()
+
+	var client struct {
+		PanicResult func() (panicJSONResult, error)
+		AddGet      func(int) (int, error)
+	}
+	closer, err := NewMergeClient(context.Background(), "ws://"+testServ.Listener.Addr().String(), "Panic", []any{&client}, nil)
+	require.NoError(t, err)
+	defer closer()
+
+	_, err = client.PanicResult()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "panic encoding response")
+	var rpcErr *JSONRPCError
+	require.True(t, errors.As(err, &rpcErr))
+	require.Equal(t, ErrorCode(0), rpcErr.Code)
+
+	got, err := client.AddGet(41)
+	require.NoError(t, err)
+	require.Equal(t, 42, got)
+}
+
+func TestChannelMarshalPanicDoesNotCrashConnection(t *testing.T) {
+	quietRPCLogsForTest(t)
+
+	rpcServer := NewServer()
+	rpcServer.Register("Panic", panicJSONHandler{})
+
+	testServ := httptest.NewServer(rpcServer)
+	defer testServ.Close()
+
+	var client struct {
+		PanicStream func() (<-chan panicJSONResult, error)
+		AddGet      func(int) (int, error)
+	}
+	closer, err := NewMergeClient(context.Background(), "ws://"+testServ.Listener.Addr().String(), "Panic", []any{&client}, nil)
+	require.NoError(t, err)
+	defer closer()
+
+	ch, err := client.PanicStream()
+	require.NoError(t, err)
+
+	select {
+	case _, ok := <-ch:
+		require.False(t, ok)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for channel close")
+	}
+
+	got, err := client.AddGet(41)
+	require.NoError(t, err)
+	require.Equal(t, 42, got)
+}
+
+func TestBatchNotificationsDoNotCreateEmptyResponses(t *testing.T) {
+	rpcHandler := SimpleServerHandler{}
+
+	rpcServer := NewServer()
+	rpcServer.Register("SimpleServerHandler", &rpcHandler)
+
+	testServ := httptest.NewServer(rpcServer)
+	defer testServ.Close()
+
+	resp, err := http.Post(testServ.URL, "application/json", strings.NewReader(`[
+		{"jsonrpc": "2.0", "method": "SimpleServerHandler.Inc", "params": []},
+		{"jsonrpc": "2.0", "method": "SimpleServerHandler.AddGet", "params": [4], "id": 1}
+	]`))
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.JSONEq(t, `[{"jsonrpc":"2.0","id":1,"result":5}]`, string(body))
+
+	resp, err = http.Post(testServ.URL, "application/json", strings.NewReader(`[
+		{"jsonrpc": "2.0", "method": "SimpleServerHandler.Inc", "params": []}
+	]`))
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Empty(t, body)
 }

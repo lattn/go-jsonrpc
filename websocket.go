@@ -28,7 +28,7 @@ var debugTrace = os.Getenv("JSONRPC_ENABLE_DEBUG_TRACE") == "1"
 type frame struct {
 	// common
 	Jsonrpc string            `json:"jsonrpc"`
-	ID      interface{}       `json:"id,omitempty"`
+	ID      any               `json:"id,omitempty"`
 	Meta    map[string]string `json:"meta,omitempty"`
 
 	// request
@@ -41,7 +41,7 @@ type frame struct {
 }
 
 type outChanReg struct {
-	reqID interface{}
+	reqID any
 
 	chID uint64
 	ch   reflect.Value
@@ -81,7 +81,7 @@ type wsConn struct {
 	// Client related
 
 	// inflight are requests we've sent to the remote
-	inflight   map[interface{}]clientRequest
+	inflight   map[any]clientRequest
 	inflightLk sync.Mutex
 
 	// chanHandlers is a map of client-side channel handlers
@@ -92,13 +92,13 @@ type wsConn struct {
 	// Server related
 
 	// handling are the calls we handle
-	handling   map[interface{}]context.CancelFunc
+	handling   map[any]context.CancelFunc
 	handlingLk sync.Mutex
 
 	spawnOutChanHandlerOnce sync.Once
 
-	// chanCtr is a counter used for identifying output channels on the server side
-	chanCtr uint64
+	// chanCtr is used for identifying output channels on the server side.
+	chanCtr atomic.Uint64
 
 	registerCh chan outChanReg
 }
@@ -108,6 +108,53 @@ type chanHandler struct {
 	lk sync.Mutex
 
 	cb func(m []byte, ok bool)
+}
+
+func logWebsocketEncodePanic(method string, r any) {
+	slog.Error("panic encoding websocket message", "method", method)
+}
+
+func encodeWebsocketResponse(w io.Writer, resp *response) {
+	defer func() {
+		if r := recover(); r != nil {
+			err := xerrors.Errorf("panic encoding websocket response: %v", r)
+			slog.Error("panic encoding websocket response", "error", err)
+
+			fallback := response{
+				Jsonrpc: "2.0",
+				ID:      resp.ID,
+				Error: &JSONRPCError{
+					Code:    0,
+					Message: err.Error(),
+				},
+			}
+			if err := json.NewEncoder(w).Encode(fallback); err != nil {
+				slog.Error("failed to encode websocket error response", "error", err)
+			}
+		}
+	}()
+
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		slog.Error("failed to encode websocket response", "error", err)
+	}
+}
+
+func marshalWebsocketParams(method string, params []param) (out []byte, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			logWebsocketEncodePanic(method, r)
+			out = nil
+			ok = false
+		}
+	}()
+
+	out, err := json.Marshal(params)
+	if err != nil {
+		slog.Error("failed to marshal websocket params", "method", method, "error", err)
+		return nil, false
+	}
+
+	return out, true
 }
 
 //                         //
@@ -223,10 +270,7 @@ func (c *wsConn) handleOutChans() {
 					Result:  registration.chID,
 				}
 
-				if err := json.NewEncoder(w).Encode(resp); err != nil {
-					slog.Error("nextWriter", "error", err)
-					return
-				}
+				encodeWebsocketResponse(w, resp)
 			})
 
 			continue
@@ -257,9 +301,8 @@ func (c *wsConn) handleOutChans() {
 			cases = cases[:n]
 			caseToID = caseToID[:n-internal]
 
-			rp, err := json.Marshal([]param{{v: reflect.ValueOf(id)}})
-			if err != nil {
-				slog.Error("Marshal", "error", err)
+			rp, ok := marshalWebsocketParams(chClose, []param{{v: reflect.ValueOf(id)}})
+			if !ok {
 				continue
 			}
 
@@ -275,9 +318,8 @@ func (c *wsConn) handleOutChans() {
 		}
 
 		// forward message
-		rp, err := json.Marshal([]param{{v: reflect.ValueOf(caseToID[chosen-internal])}, {v: val}})
-		if err != nil {
-			slog.Error("marshaling params for sendRequest failed", "error", err)
+		rp, ok := marshalWebsocketParams(chValue, []param{{v: reflect.ValueOf(caseToID[chosen-internal])}, {v: val}})
+		if !ok {
 			continue
 		}
 
@@ -294,11 +336,11 @@ func (c *wsConn) handleOutChans() {
 }
 
 // handleChanOut registers output channel for forwarding to client
-func (c *wsConn) handleChanOut(ch reflect.Value, req interface{}) error {
+func (c *wsConn) handleChanOut(ch reflect.Value, req any) error {
 	c.spawnOutChanHandlerOnce.Do(func() {
 		go c.handleOutChans()
 	})
-	id := atomic.AddUint64(&c.chanCtr, 1)
+	id := c.chanCtr.Add(1)
 
 	select {
 	case c.registerCh <- outChanReg{
@@ -324,7 +366,11 @@ func (c *wsConn) handleChanOut(ch reflect.Value, req interface{}) error {
 //	This should also probably be a single goroutine,
 //	Note that not doing this should be fine for now as long as we are using
 //	contexts correctly (cancelling when async functions are no longer is use)
-func (c *wsConn) handleCtxAsync(actx context.Context, id interface{}) {
+func (c *wsConn) handleCtxAsync(actx context.Context, id any) {
+	if actx == nil {
+		return
+	}
+
 	<-actx.Done()
 
 	rp, err := json.Marshal([]param{{v: reflect.ValueOf(id)}})
@@ -342,21 +388,48 @@ func (c *wsConn) handleCtxAsync(actx context.Context, id interface{}) {
 	}
 }
 
+func wsControlParams(method string, raw json.RawMessage, min int) ([]param, bool) {
+	var params []param
+	if err := json.Unmarshal(raw, &params); err != nil {
+		slog.Warn("failed to unmarshal websocket control params", "method", method, "error", err)
+		return nil, false
+	}
+
+	if len(params) < min {
+		slog.Warn("invalid websocket control params", "method", method, "params", len(params), "min", min)
+		return nil, false
+	}
+
+	return params, true
+}
+
+func wsControlValue[T any](method, name string, raw []byte) (T, bool) {
+	var out T
+	if err := json.Unmarshal(raw, &out); err != nil {
+		slog.Warn("failed to unmarshal websocket control value", "method", method, "value", name, "error", err)
+		return out, false
+	}
+
+	return out, true
+}
+
 // cancelCtx is a built-in rpc which handles context cancellation over rpc
 func (c *wsConn) cancelCtx(req frame) {
 	if req.ID != nil {
 		slog.Warn("call with ID set, won't respond", "id", wsCancel)
 	}
 
-	var params []param
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		slog.Error("failed to unmarshal channel id in xrpc.ch.val", "error", err)
+	params, ok := wsControlParams(wsCancel, req.Params, 1)
+	if !ok {
 		return
 	}
-
-	var id interface{}
-	if err := json.Unmarshal(params[0].data, &id); err != nil {
-		slog.Error("failed to unmarshal cancel ID", "error", err)
+	id, ok := wsControlValue[any](wsCancel, "id", params[0].data)
+	if !ok {
+		return
+	}
+	id, err := normalizeID(id)
+	if err != nil {
+		slog.Warn("invalid websocket control id", "method", wsCancel, "error", err)
 		return
 	}
 
@@ -374,15 +447,13 @@ func (c *wsConn) cancelCtx(req frame) {
 //                     //
 
 func (c *wsConn) handleChanMessage(frame frame) {
-	var params []param
-	if err := json.Unmarshal(frame.Params, &params); err != nil {
-		slog.Error("failed to unmarshal channel id in xrpc.ch.val", "error", err)
+	params, ok := wsControlParams(chValue, frame.Params, 2)
+	if !ok {
 		return
 	}
 
-	var chid uint64
-	if err := json.Unmarshal(params[0].data, &chid); err != nil {
-		slog.Error("failed to unmarshal channel id in xrpc.ch.val", "error", err)
+	chid, ok := wsControlValue[uint64](chValue, "channel", params[0].data)
+	if !ok {
 		return
 	}
 
@@ -403,15 +474,13 @@ func (c *wsConn) handleChanMessage(frame frame) {
 }
 
 func (c *wsConn) handleChanClose(frame frame) {
-	var params []param
-	if err := json.Unmarshal(frame.Params, &params); err != nil {
-		slog.Error("failed to unmarshal channel id in xrpc.ch.val", "error", err)
+	params, ok := wsControlParams(chClose, frame.Params, 1)
+	if !ok {
 		return
 	}
 
-	var chid uint64
-	if err := json.Unmarshal(params[0].data, &chid); err != nil {
-		slog.Error("failed to unmarshal channel id in xrpc.ch.val", "error", err)
+	chid, ok := wsControlValue[uint64](chClose, "channel", params[0].data)
+	if !ok {
 		return
 	}
 
@@ -419,7 +488,7 @@ func (c *wsConn) handleChanClose(frame frame) {
 	hnd, ok := c.chanHandlers[chid]
 	if !ok {
 		c.chanHandlersLk.Unlock()
-		slog.Error("xrpc.ch.val: handler not found", "handler", chid)
+		slog.Error("xrpc.ch.close: handler not found", "handler", chid)
 		return
 	}
 
@@ -547,14 +616,14 @@ func (c *wsConn) closeInFlight() {
 			},
 		}
 	}
-	c.inflight = map[interface{}]clientRequest{}
+	c.inflight = map[any]clientRequest{}
 	c.inflightLk.Unlock()
 
 	c.handlingLk.Lock()
 	for _, cancel := range c.handling {
 		cancel()
 	}
-	c.handling = map[interface{}]context.CancelFunc{}
+	c.handling = map[any]context.CancelFunc{}
 	c.handlingLk.Unlock()
 }
 
@@ -579,10 +648,6 @@ func (c *wsConn) closeChans() {
 }
 
 func (c *wsConn) setupPings() func() {
-	if c.pingInterval == 0 {
-		return func() {}
-	}
-
 	c.conn.SetPongHandler(func(appData string) error {
 		select {
 		case c.pongs <- struct{}{}:
@@ -590,14 +655,22 @@ func (c *wsConn) setupPings() func() {
 		}
 		return nil
 	})
+	pingHandler := c.conn.PingHandler()
 	c.conn.SetPingHandler(func(appData string) error {
-		// treat pings as pongs - this lets us register server activity even if it's too busy to respond to our pings
+		// Record activity before delegating to the websocket ping handler. This
+		// preserves the historical "treat pings as pongs" behavior while still
+		// replying with a protocol-level pong.
 		select {
 		case c.pongs <- struct{}{}:
 		default:
 		}
-		return nil
+
+		return pingHandler(appData)
 	})
+
+	if c.pingInterval == 0 {
+		return func() {}
+	}
 
 	stop := make(chan struct{})
 
@@ -729,8 +802,8 @@ func (c *wsConn) handleWsConn(ctx context.Context) {
 	c.incoming = make(chan io.Reader)
 	c.readError = make(chan error, 1)
 	c.frameExecQueue = make(chan []byte, maxQueuedFrames)
-	c.inflight = map[interface{}]clientRequest{}
-	c.handling = map[interface{}]context.CancelFunc{}
+	c.inflight = map[any]clientRequest{}
+	c.handling = map[any]context.CancelFunc{}
 	c.chanHandlers = map[uint64]*chanHandler{}
 	c.pongs = make(chan struct{}, 1)
 
@@ -943,7 +1016,7 @@ func (c *wsConn) resetReadDeadline() {
 
 // Takes an ID as received on the wire, validates it, and translates it to a
 // normalized ID appropriate for keying.
-func normalizeID(id interface{}) (interface{}, error) {
+func normalizeID(id any) (any, error) {
 	switch v := id.(type) {
 	case string, float64, nil:
 		return v, nil

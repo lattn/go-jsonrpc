@@ -21,7 +21,7 @@ import (
 
 type RawParams json.RawMessage
 
-var rtRawParams = reflect.TypeOf(RawParams{})
+var rtRawParams = reflect.TypeFor[RawParams]()
 
 // todo is there a better way to tell 'struct with any number of fields'?
 func DecodeParams[T any](p RawParams) (T, error) {
@@ -52,7 +52,7 @@ type methodHandler struct {
 
 type request struct {
 	Jsonrpc string            `json:"jsonrpc"`
-	ID      interface{}       `json:"id,omitempty"`
+	ID      any               `json:"id,omitempty"`
 	Method  string            `json:"method"`
 	Params  json.RawMessage   `json:"params"`
 	Meta    map[string]string `json:"meta,omitempty"`
@@ -101,7 +101,7 @@ func makeHandler(sc ServerConfig) *handler {
 
 // Register
 
-func (s *handler) register(namespace string, r interface{}) {
+func (s *handler) register(namespace string, r any) {
 	val := reflect.ValueOf(r)
 	// TODO: expect ptr
 
@@ -149,7 +149,7 @@ func (s *handler) register(namespace string, r interface{}) {
 
 type rpcErrFunc func(w func(func(io.Writer)), req *request, code ErrorCode, err error)
 
-type chanOut func(reflect.Value, interface{}) error
+type chanOut func(reflect.Value, any) error
 
 func (s *handler) handleReader(ctx context.Context, r io.Reader, w io.Writer, rpcError rpcErrFunc) {
 	wf := func(cb func(io.Writer)) {
@@ -204,20 +204,21 @@ func (s *handler) handleReader(ctx context.Context, r io.Reader, w io.Writer, rp
 			return
 		}
 
-		_, _ = w.Write([]byte("[")) // todo consider handling this error
-		for idx, req := range reqs {
+		bw := batchWriter{w: w}
+		batchItem := func(cb func(io.Writer)) {
+			cb(&batchItemWriter{batch: &bw})
+		}
+		for _, req := range reqs {
 			if req.ID, err = normalizeID(req.ID); err != nil {
-				rpcError(wf, &req, rpcParseError, xerrors.Errorf("failed to parse ID: %w", err))
-				return
-			}
-
-			s.handle(ctx, req, wf, rpcError, func(bool) {}, nil)
-
-			if idx != len(reqs)-1 {
-				_, _ = w.Write([]byte(",")) // todo consider handling this error
+				rpcError(batchItem, &req, rpcParseError, xerrors.Errorf("failed to parse ID: %w", err))
+			} else {
+				s.handle(ctx, req, batchItem, rpcError, func(bool) {}, nil)
 			}
 		}
-		_, _ = w.Write([]byte("]")) // todo consider handling this error
+
+		if bw.wrote {
+			_, _ = io.WriteString(w, "]") // todo consider handling this error
+		}
 	} else {
 		var req request
 		if err := json.NewDecoder(bufferedRequest).Decode(&req); err != nil {
@@ -232,6 +233,34 @@ func (s *handler) handleReader(ctx context.Context, r io.Reader, w io.Writer, rp
 
 		s.handle(ctx, req, wf, rpcError, func(bool) {}, nil)
 	}
+}
+
+type batchWriter struct {
+	w     io.Writer
+	wrote bool
+}
+
+type batchItemWriter struct {
+	batch *batchWriter
+	wrote bool
+}
+
+func (w *batchItemWriter) Write(p []byte) (int, error) {
+	if !w.wrote {
+		if !w.batch.wrote {
+			if _, err := io.WriteString(w.batch.w, "["); err != nil {
+				return 0, err
+			}
+			w.batch.wrote = true
+		} else {
+			if _, err := io.WriteString(w.batch.w, ","); err != nil {
+				return 0, err
+			}
+		}
+		w.wrote = true
+	}
+
+	return w.batch.w.Write(p)
 }
 
 func doCall(methodName string, f reflect.Value, params []reflect.Value) (out []reflect.Value, err error) {
@@ -254,11 +283,12 @@ func (s *handler) getSpan(ctx context.Context, req request) (context.Context, *t
 	var span *trace.Span
 	if eSC, ok := req.Meta["SpanContext"]; ok {
 		bSC := make([]byte, base64.StdEncoding.DecodedLen(len(eSC)))
-		_, err := base64.StdEncoding.Decode(bSC, []byte(eSC))
+		n, err := base64.StdEncoding.Decode(bSC, []byte(eSC))
 		if err != nil {
 			slog.Error("SpanContext: decode", "error", err)
 			return ctx, nil
 		}
+		bSC = bSC[:n]
 		sc, ok := propagation.FromBinary(bSC)
 		if !ok {
 			slog.Error("SpanContext: could not create span", "data", bSC)
@@ -430,7 +460,7 @@ func (s *handler) handle(ctx context.Context, req request, w func(func(io.Writer
 	}
 
 	var kind reflect.Kind
-	var res interface{}
+	var res any
 	var nonZero bool
 	if handler.valOut != -1 {
 		res = callResult[handler.valOut].Interface()
@@ -466,13 +496,23 @@ func (s *handler) handle(ctx context.Context, req request, w func(func(io.Writer
 		slog.Error("error and res returned", "request", req, "r.err", resp.Error, "res", res)
 	}
 
-	withLazyWriter(w, func(w io.Writer) {
-		if err := json.NewEncoder(w).Encode(resp); err != nil {
-			slog.Error("withLazyWriter", "error", err)
-			stats.Record(ctx, metrics.RPCResponseError.M(1))
-			return
-		}
-	})
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				err := xerrors.Errorf("panic encoding response for '%s': %v", req.Method, r)
+				slog.Error("panic encoding response", "method", req.Method, "error", r)
+				stats.Record(ctx, metrics.RPCResponseError.M(1))
+				rpcError(w, &req, 0, err)
+			}
+		}()
+		withLazyWriter(w, func(w io.Writer) {
+			if err := json.NewEncoder(w).Encode(resp); err != nil {
+				slog.Error("withLazyWriter", "error", err)
+				stats.Record(ctx, metrics.RPCResponseError.M(1))
+				return
+			}
+		})
+	}()
 }
 
 // withLazyWriter makes it possible to defer acquiring a writer until the first write.

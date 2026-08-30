@@ -30,8 +30,8 @@ const (
 )
 
 var (
-	errorType   = reflect.TypeOf(new(error)).Elem()
-	contextType = reflect.TypeOf(new(context.Context)).Elem()
+	errorType   = reflect.TypeFor[error]()
+	contextType = reflect.TypeFor[context.Context]()
 
 	_defaultHTTPClient = &http.Client{
 		Transport: &http.Transport{
@@ -39,7 +39,6 @@ var (
 			DialContext: (&net.Dialer{
 				Timeout:   30 * time.Second,
 				KeepAlive: 30 * time.Second,
-				DualStack: true,
 			}).DialContext,
 			ForceAttemptHTTP2:     true,
 			MaxIdleConns:          100,
@@ -68,7 +67,7 @@ func (e *ErrClient) Unwrap() error {
 type clientResponse struct {
 	Jsonrpc string          `json:"jsonrpc"`
 	Result  json.RawMessage `json:"result"`
-	ID      interface{}     `json:"id"`
+	ID      any             `json:"id"`
 	Error   *JSONRPCError   `json:"error,omitempty"`
 }
 
@@ -90,8 +89,8 @@ type ClientCloser func()
 // handler must be pointer to a struct with function fields
 // Returned value closes the client connection
 // TODO: Example
-func NewClient(ctx context.Context, addr string, namespace string, handler interface{}, requestHeader http.Header, opts ...Option) (ClientCloser, error) {
-	return NewMergeClient(ctx, addr, namespace, []interface{}{handler}, requestHeader, opts...)
+func NewClient(ctx context.Context, addr string, namespace string, handler any, requestHeader http.Header, opts ...Option) (ClientCloser, error) {
+	return NewMergeClient(ctx, addr, namespace, []any{handler}, requestHeader, opts...)
 }
 
 type client struct {
@@ -101,14 +100,14 @@ type client struct {
 
 	doRequest func(context.Context, clientRequest) (clientResponse, error)
 	exiting   <-chan struct{}
-	idCtr     int64
+	idCtr     atomic.Int64
 
 	methodNameFormatter MethodNameFormatter
 }
 
 // NewMergeClient is like NewClient, but allows to specify multiple structs
 // to be filled in the same namespace, using one connection
-func NewMergeClient(ctx context.Context, addr string, namespace string, outs []interface{}, requestHeader http.Header, opts ...Option) (ClientCloser, error) {
+func NewMergeClient(ctx context.Context, addr string, namespace string, outs []any, requestHeader http.Header, opts ...Option) (ClientCloser, error) {
 	config := defaultConfig()
 	for _, o := range opts {
 		o(&config)
@@ -130,7 +129,7 @@ func NewMergeClient(ctx context.Context, addr string, namespace string, outs []i
 }
 
 // NewCustomClient is like NewMergeClient in single-request (http) mode, except it allows for a custom doRequest function
-func NewCustomClient(namespace string, outs []interface{}, doRequest func(ctx context.Context, body []byte) (io.ReadCloser, error), opts ...Option) (ClientCloser, error) {
+func NewCustomClient(namespace string, outs []any, doRequest func(ctx context.Context, body []byte) (io.ReadCloser, error), opts ...Option) (ClientCloser, error) {
 	config := defaultConfig()
 	for _, o := range opts {
 		o(&config)
@@ -190,7 +189,7 @@ func NewCustomClient(namespace string, outs []interface{}, doRequest func(ctx co
 	}, nil
 }
 
-func httpClient(ctx context.Context, addr string, namespace string, outs []interface{}, requestHeader http.Header, config Config) (ClientCloser, error) {
+func httpClient(ctx context.Context, addr string, namespace string, outs []any, requestHeader http.Header, config Config) (ClientCloser, error) {
 	c := client{
 		namespace:           namespace,
 		paramEncoders:       config.paramEncoders,
@@ -264,7 +263,7 @@ func httpClient(ctx context.Context, addr string, namespace string, outs []inter
 	}, nil
 }
 
-func websocketClient(ctx context.Context, addr string, namespace string, outs []interface{}, requestHeader http.Header, config Config) (ClientCloser, error) {
+func websocketClient(ctx context.Context, addr string, namespace string, outs []any, requestHeader http.Header, config Config) (ClientCloser, error) {
 	connFactory := func() (*websocket.Conn, error) {
 		conn, _, err := websocket.DefaultDialer.Dial(addr, requestHeader)
 		if err != nil {
@@ -397,7 +396,7 @@ func (c *client) setupRequestChan() chan clientRequest {
 	return requests
 }
 
-func (c *client) provide(outs []interface{}) error {
+func (c *client) provide(outs []any) error {
 	for _, handler := range outs {
 		htyp := reflect.TypeOf(handler)
 		if htyp.Kind() != reflect.Ptr {
@@ -424,6 +423,10 @@ func (c *client) provide(outs []interface{}) error {
 }
 
 func (c *client) makeOutChan(ctx context.Context, ftyp reflect.Type, valOut int) (func() reflect.Value, makeChanSink) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	retVal := reflect.Zero(ftyp.Out(valOut))
 
 	chCtor := func() (context.Context, func([]byte, bool)) {
@@ -441,32 +444,41 @@ func (c *client) makeOutChan(ctx context.Context, ftyp reflect.Type, valOut int)
 			for {
 				front := buf.Front()
 
-				cases := []reflect.SelectCase{
-					{
-						Dir:  reflect.SelectRecv,
-						Chan: reflect.ValueOf(ctx.Done()),
-					},
-					{
-						Dir:  reflect.SelectRecv,
-						Chan: reflect.ValueOf(incoming),
-					},
+				var cases [3]reflect.SelectCase
+				ncases := 1
+				cases[0] = reflect.SelectCase{
+					Dir:  reflect.SelectRecv,
+					Chan: reflect.ValueOf(ctx.Done()),
 				}
 
+				incomingCase := -1
+				if incoming != nil {
+					incomingCase = ncases
+					cases[ncases] = reflect.SelectCase{
+						Dir:  reflect.SelectRecv,
+						Chan: reflect.ValueOf(incoming),
+					}
+					ncases++
+				}
+
+				sendCase := -1
 				if front != nil {
-					cases = append(cases, reflect.SelectCase{
+					sendCase = ncases
+					cases[ncases] = reflect.SelectCase{
 						Dir:  reflect.SelectSend,
 						Chan: ch,
 						Send: front.Value.(reflect.Value).Elem(),
-					})
+					}
+					ncases++
 				}
 
-				chosen, val, ok := reflect.Select(cases)
+				chosen, val, ok := reflect.Select(cases[:ncases])
 
 				switch chosen {
 				case 0:
 					ch.Close()
 					return
-				case 1:
+				case incomingCase:
 					if ok {
 						vvval := val.Interface().(reflect.Value)
 						buf.PushBack(vvval)
@@ -481,7 +493,7 @@ func (c *client) makeOutChan(ctx context.Context, ftyp reflect.Type, valOut int)
 						incoming = nil
 					}
 
-				case 2:
+				case sendCase:
 					buf.Remove(front)
 				}
 
@@ -582,9 +594,9 @@ func (fn *rpcFunc) processError(err error) []reflect.Value {
 }
 
 func (fn *rpcFunc) handleRpcCall(args []reflect.Value) (results []reflect.Value) {
-	var id interface{}
+	var id any
 	if !fn.notify {
-		id = atomic.AddInt64(&fn.client.idCtr, 1)
+		id = fn.client.idCtr.Add(1)
 
 		// Prepare the ID to send on the wire.
 		// We track int64 ids as float64 in the inflight map (because that's what
@@ -654,7 +666,8 @@ func (fn *rpcFunc) handleRpcCall(args []reflect.Value) (results []reflect.Value)
 		span.AddAttributes(trace.StringAttribute("method", req.Method))
 
 		eSC := base64.StdEncoding.EncodeToString(
-			propagation.Binary(span.SpanContext()))
+			propagation.Binary(span.SpanContext()),
+		)
 		req.Meta = map[string]string{
 			"SpanContext": eSC,
 		}
